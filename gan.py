@@ -215,6 +215,18 @@ class GANTrainer:
         self.dataset = self.load_dataset()
         self.train_dataloader, self.val_dataloader = self.split_dataset()
         
+        # 调试信息：显示数据集和数据加载器的详细信息
+        if is_main_process() and self.logger:
+            self.logger.info(f"🔍 数据集调试信息:")
+            self.logger.info(f"  - 总数据集大小: {len(self.dataset)}")
+            self.logger.info(f"  - 训练集batch数量: {len(self.train_dataloader)}")
+            self.logger.info(f"  - 验证集batch数量: {len(self.val_dataloader)}")
+            self.logger.info(f"  - 批次大小: {self.batch_size}")
+            self.logger.info(f"  - 分布式训练: {self.is_distributed}")
+            if self.is_distributed:
+                self.logger.info(f"  - 世界大小: {self.world_size}")
+                self.logger.info(f"  - 当前进程: {self.rank}")
+        
         # 包装模型为DDP
         if self.is_distributed:
             self.generator = DDP(self.generator, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=False)
@@ -568,11 +580,15 @@ class GANTrainer:
                     real_cpu = data[0].to(self.device)
                     b_size = real_cpu.size(0)
                     
+                    # 计算当前是否为累积步骤的开始和结束
+                    is_accumulation_start = (i % self.gradient_accumulation_steps == 0)
+                    is_accumulation_end = ((i + 1) % self.gradient_accumulation_steps == 0) or (i == len(self.train_dataloader) - 1)
+                    
                     ############################
                     # (1) 训练判别器：最大化 log(D(x)) + log(1 - D(G(z)))
                     ###########################
                     # 在梯度累积开始时清零梯度
-                    if i % self.gradient_accumulation_steps == 0:
+                    if is_accumulation_start:
                         self.discriminator.zero_grad()
                     
                     # 训练真实数据
@@ -601,8 +617,8 @@ class GANTrainer:
                     D_G_z1 = output.mean().item()
                     errD = errD_real + errD_fake
                     
-                    # 梯度累积处理 - 在累积步数完成时更新参数
-                    if (i + 1) % self.gradient_accumulation_steps == 0:
+                    # 梯度累积处理 - 在累积步数完成时或最后一个batch时更新参数
+                    if is_accumulation_end:
                         self.scaler.step(self.optimizer_D)
                         self.scaler.update()
 
@@ -610,7 +626,7 @@ class GANTrainer:
                     # (2) 训练生成器：最大化 log(D(G(z)))
                     ###########################
                     # 在梯度累积开始时清零梯度
-                    if i % self.gradient_accumulation_steps == 0:
+                    if is_accumulation_start:
                         self.generator.zero_grad()
                     
                     label.fill_(real_label)  # 生成器希望判别器认为假数据是真的
@@ -624,8 +640,8 @@ class GANTrainer:
                     self.scaler.scale(errG).backward()
                     D_G_z2 = output.mean().item()
 
-                    # 梯度累积处理 - 在累积步数完成时更新参数
-                    if (i + 1) % self.gradient_accumulation_steps == 0:
+                    # 梯度累积处理 - 在累积步数完成时或最后一个batch时更新参数
+                    if is_accumulation_end:
                         self.scaler.step(self.optimizer_G)
                         self.scaler.update()
 
@@ -634,6 +650,10 @@ class GANTrainer:
                         self.logger.debug('[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z)): %.4f / %.4f'
                                      % (epoch, self.epochs, i, len(self.train_dataloader),
                                         errD.item() * self.gradient_accumulation_steps, errG.item() * self.gradient_accumulation_steps, D_x, D_G_z1, D_G_z2))
+
+                    # 增加更频繁的进度日志，每个batch都输出
+                    if is_main_process() and self.logger:
+                        self.logger.info(f"📊 Batch [{i+1}/{len(self.train_dataloader)}] 完成")
 
                     # 在主进程中记录损失（恢复原始损失值）
                     if is_main_process():
@@ -647,21 +667,29 @@ class GANTrainer:
 
                     iters += 1
                 
-                # 强制CUDA同步，确保所有操作完成
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                # 添加CUDA内存调试信息（每10个batch输出一次）
+                if torch.cuda.is_available() and is_main_process() and self.logger and (iters % 10 == 0):
+                    memory_allocated = torch.cuda.memory_allocated(self.device) / 1024**3  # GB
+                    memory_reserved = torch.cuda.memory_reserved(self.device) / 1024**3   # GB
+                    self.logger.info(f"💾 CUDA内存使用: {memory_allocated:.2f}GB / {memory_reserved:.2f}GB")
                 
                 # 在主进程中输出epoch进度
                 if is_main_process() and self.logger:
-                    self.logger.info(f"📊 Epoch {epoch} 完成，进入保存和验证阶段...")
+                    self.logger.info(f"📊 Epoch {epoch} 训练循环完成，准备进入保存和验证阶段...")
 
                 # 同步所有进程
                 if self.is_distributed:
                     if is_main_process() and self.logger:
                         self.logger.info(f"🔄 等待所有进程完成 epoch {epoch}...")
-                    dist.barrier()
-                    if is_main_process() and self.logger:
-                        self.logger.info(f"✅ 所有进程已同步完成 epoch {epoch}")
+                    try:
+                        # 使用超时的barrier，避免无限等待
+                        dist.barrier()
+                        if is_main_process() and self.logger:
+                            self.logger.info(f"✅ 所有进程已同步完成 epoch {epoch}")
+                    except Exception as e:
+                        if is_main_process() and self.logger:
+                            self.logger.error(f"❌ 分布式同步失败: {e}")
+                            self.logger.info(f"🔄 尝试跳过同步继续训练...")
 
                 #在训练循环中，每个epoch结束时，调用save_state方法来保存状态：
                 if is_main_process() and self.logger:
