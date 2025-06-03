@@ -445,7 +445,7 @@ class GANTrainer:
                 train_dataset, 
                 batch_size=self.batch_size, 
                 sampler=train_sampler,
-                num_workers=2,  # 在分布式训练中使用更少的worker
+                num_workers=0,  # 分布式训练中避免多进程冲突
                 collate_fn=collate_fn,
                 pin_memory=True
             )
@@ -453,7 +453,7 @@ class GANTrainer:
                 val_dataset, 
                 batch_size=self.batch_size, 
                 sampler=val_sampler,
-                num_workers=2,
+                num_workers=0,  # 分布式训练中避免多进程冲突
                 collate_fn=collate_fn,
                 pin_memory=True
             )
@@ -549,11 +549,14 @@ class GANTrainer:
                     real_cpu = data[0].to(self.device)
                     b_size = real_cpu.size(0)
                     
+                    # 在每个batch开始时清零梯度（如果是累积步骤的开始）
+                    if i % self.gradient_accumulation_steps == 0:
+                        self.optimizer_D.zero_grad()
+                        self.optimizer_G.zero_grad()
+                    
                     ############################
                     # (1) 训练判别器：最大化 log(D(x)) + log(1 - D(G(z)))
                     ###########################
-                    self.discriminator.zero_grad()
-                    
                     # 训练真实数据
                     label = torch.full((b_size,), real_label, dtype=torch.float, device=self.device)
                     
@@ -577,16 +580,14 @@ class GANTrainer:
                     D_G_z1 = output.mean().item()
                     errD = errD_real + errD_fake
                     
-                    # 梯度累积处理
+                    # 梯度累积处理 - 判别器
                     if (i + 1) % self.gradient_accumulation_steps == 0:
                         self.scaler.step(self.optimizer_D)
                         self.scaler.update()
-                        self.discriminator.zero_grad()
 
                     ############################
                     # (2) 训练生成器：最大化 log(D(G(z)))
                     ###########################
-                    self.generator.zero_grad()
                     label.fill_(real_label)  # 生成器希望判别器认为假数据是真的
                     
                     with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
@@ -596,11 +597,10 @@ class GANTrainer:
                     self.scaler.scale(errG).backward()
                     D_G_z2 = output.mean().item()
 
-                    # 梯度累积处理
+                    # 梯度累积处理 - 生成器
                     if (i + 1) % self.gradient_accumulation_steps == 0:
                         self.scaler.step(self.optimizer_G)
                         self.scaler.update()
-                        self.generator.zero_grad()
 
                     # 只在主进程输出训练日志
                     if i % 50 == 0 and is_main_process():
