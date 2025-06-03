@@ -96,18 +96,12 @@ setup_utf8_environment()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def collate_fn(batch):
-    """批量数据整理函数，确保数据在正确的设备上，支持分布式训练"""
+    """批量数据整理函数，保持数据在CPU上，避免与pin_memory冲突"""
     images, labels = zip(*batch)
     
-    # 在分布式训练中，获取当前进程的设备
-    if torch.cuda.is_available() and dist.is_initialized():
-        device = torch.device(f'cuda:{get_rank()}')
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    images = torch.stack([img.to(device) for img in images])
-    # 将标签转换为tensor并移动到设备
-    labels = torch.tensor(labels, device=device)
+    # 不在这里移动到GPU，保持在CPU上避免与pin_memory冲突
+    images = torch.stack(images)
+    labels = torch.tensor(labels)
     return images, labels
 
 class MyDataset(Dataset):
@@ -450,17 +444,17 @@ class GANTrainer:
                 train_dataset, 
                 batch_size=self.batch_size, 
                 sampler=train_sampler,
-                num_workers=2,  # 在分布式训练中使用更少的worker
+                num_workers=0,  # 在分布式训练中使用单线程避免潜在问题
                 collate_fn=collate_fn,
-                pin_memory=True
+                pin_memory=True if torch.cuda.is_available() else False
             )
             val_dataloader = DataLoader(
                 val_dataset, 
                 batch_size=self.batch_size, 
                 sampler=val_sampler,
-                num_workers=2,
+                num_workers=0,  # 在分布式训练中使用单线程
                 collate_fn=collate_fn,
-                pin_memory=True
+                pin_memory=True if torch.cuda.is_available() else False
             )
         else:
             train_dataloader = DataLoader(
@@ -844,8 +838,11 @@ def _distributed_train_worker(rank, world_size, dataset_path, kwargs):
     分布式训练工作进程
     """
     try:
+        print(f"[Rank {rank}] 开始初始化分布式训练工作进程...")
+        
         # 设置分布式环境
         setup_distributed(rank, world_size)
+        print(f"[Rank {rank}] 分布式环境设置完成")
         
         # 创建训练器并设置分布式参数
         trainer = GANTrainer(
@@ -855,17 +852,23 @@ def _distributed_train_worker(rank, world_size, dataset_path, kwargs):
             world_size=world_size,
             **kwargs
         )
+        print(f"[Rank {rank}] 训练器创建完成")
         
         # 开始训练
         trainer.train()
         
     except Exception as e:
-        if is_main_process():
-            print(f"分布式训练出错: {e}")
+        import traceback
+        error_msg = f"[Rank {rank}] 分布式训练出错: {e}\n{traceback.format_exc()}"
+        print(error_msg)
         raise e
     finally:
-        # 清理分布式环境
-        cleanup_distributed()
+        try:
+            # 清理分布式环境
+            cleanup_distributed()
+            print(f"[Rank {rank}] 分布式环境清理完成")
+        except Exception as cleanup_e:
+            print(f"[Rank {rank}] 分布式环境清理失败: {cleanup_e}")
 
 
 if __name__ == '__main__':
