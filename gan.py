@@ -576,7 +576,7 @@ class GANTrainer:
                     D_G_z1 = output.mean().item()
                     errD = errD_real + errD_fake
                     
-                    # 梯度累积处理
+                    # 梯度累积处理 - 简化逻辑
                     if (i + 1) % self.gradient_accumulation_steps == 0:
                         self.scaler.step(self.optimizer_D)
                         self.scaler.update()
@@ -595,7 +595,7 @@ class GANTrainer:
                     self.scaler.scale(errG).backward()
                     D_G_z2 = output.mean().item()
 
-                    # 梯度累积处理
+                    # 梯度累积处理 - 简化逻辑
                     if (i + 1) % self.gradient_accumulation_steps == 0:
                         self.scaler.step(self.optimizer_G)
                         self.scaler.update()
@@ -618,7 +618,7 @@ class GANTrainer:
 
                     iters += 1
 
-                # 在分布式训练中同步所有进程
+                # Epoch结束后的同步 - 只在epoch结束时同步一次
                 if self.distributed:
                     dist.barrier()
 
@@ -658,42 +658,41 @@ class GANTrainer:
                     self.generator.eval()
                     val_loss = 0
                     
-                    # 在分布式训练中，只在主进程进行验证
+                    # 在分布式训练中，所有进程都进行验证，但只有主进程输出日志
+                    with torch.no_grad():
+                        for val_i, data in enumerate(self.val_dataloader, 0):
+                            real_cpu = data[0].to(self.device)
+                            b_size = real_cpu.size(0)
+                            label = torch.full((b_size,), real_label, dtype=torch.float, device=self.device)
+                            output = self.discriminator(real_cpu).view(-1)
+                            errD_real = self.criterion(output, label)
+                            D_x = output.mean().item()
+
+                            noise = torch.randn(b_size, self.latent_dim, 1, 1, device=self.device)
+                            fake = self.generator(noise)
+                            label.fill_(fake_label)
+                            output = self.discriminator(fake.detach()).view(-1)
+                            errD_fake = self.criterion(output, label)
+                            D_G_z1 = output.mean().item()
+                            errD = errD_real + errD_fake
+
+                            label.fill_(real_label)
+                            output = self.discriminator(fake).view(-1)
+                            errG = self.criterion(output, label)
+                            D_G_z2 = output.mean().item()
+
+                            val_loss += errG.item() + errD.item()
+
+                    val_loss /= len(self.val_dataloader)
+                    
+                    # 只在主进程输出验证日志和进行早停检查
                     if is_main_process():
-                        with torch.no_grad():
-                            for i, data in enumerate(self.val_dataloader, 0):
-                                real_cpu = data[0].to(self.device)
-                                b_size = real_cpu.size(0)
-                                label = torch.full((b_size,), real_label, dtype=torch.float, device=self.device)
-                                output = self.discriminator(real_cpu).view(-1)
-                                errD_real = self.criterion(output, label)
-                                D_x = output.mean().item()
-
-                                noise = torch.randn(b_size, self.latent_dim, 1, 1, device=self.device)
-                                fake = self.generator(noise)
-                                label.fill_(fake_label)
-                                output = self.discriminator(fake.detach()).view(-1)
-                                errD_fake = self.criterion(output, label)
-                                D_G_z1 = output.mean().item()
-                                errD = errD_real + errD_fake
-
-                                label.fill_(real_label)
-                                output = self.discriminator(fake).view(-1)
-                                errG = self.criterion(output, label)
-                                D_G_z2 = output.mean().item()
-
-                                val_loss += errG.item() + errD.item()
-
-                        val_loss /= len(self.val_dataloader)
                         self.logger.debug(f'训练到第{epoch}个周期后的验证损失为: {val_loss}')
 
                         # 早停逻辑：如果验证损失改善，重置计数器
                         if val_loss < self.best_val_loss - self.min_delta:
                             self.best_val_loss = val_loss
                             early_stopping_counter = 0
-
-                            self.generator.train()
-                            self.discriminator.train()
 
                             # 在每个epoch结束时保存此时的模型文件
                             # 保存生成器的模型
@@ -725,8 +724,11 @@ class GANTrainer:
                                 self.logger.debug(
                                     f'训练到第{epoch}个周期后停止训练，因为早停次数大于等于耐心值：{self.patience}且验证损失没有改善，或者改善的幅度小于min_delta')
                                 break
+
+                    self.generator.train()
+                    self.discriminator.train()
                     
-                    # 在分布式训练中同步所有进程
+                    # 验证结束后的同步
                     if self.distributed:
                         dist.barrier()
 
