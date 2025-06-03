@@ -60,6 +60,7 @@ def safe_emoji(emoji_text, fallback_text):
 
 def setup_distributed():
     """设置分布式训练环境"""
+    # 检查是否在torchrun环境中
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
@@ -70,6 +71,12 @@ def setup_distributed():
         torch.cuda.set_device(local_rank)
         
         return True, rank, world_size, local_rank
+    # 检查是否通过环境变量指定了分布式训练（但这种方式已废弃）
+    elif 'USE_DISTRIBUTED' in os.environ:
+        # 这种方式已不推荐，输出警告
+        print("⚠️ 警告：通过环境变量USE_DISTRIBUTED启用分布式训练的方式已废弃")
+        print("请使用 torchrun 命令启动分布式训练")
+        return False, 0, 1, 0
     else:
         return False, 0, 1, 0
 
@@ -402,10 +409,28 @@ class GANTrainer:
 
     def save_state(self, epoch):
         """保存训练状态，支持DDP模型"""
-        # 在分布式训练中，先同步所有进程
-        if self.is_distributed:
-            dist.barrier()
+        # 只在分布式训练且确实初始化了时才进行barrier同步
+        if self.is_distributed and dist.is_initialized():
+            try:
+                # 添加超时保护的barrier
+                import signal
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("保存状态时分布式同步超时")
+                
+                if hasattr(signal, 'SIGALRM'):  # Unix系统
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(10)  # 10秒超时
+                
+                dist.barrier()
+                
+                if hasattr(signal, 'SIGALRM'):
+                    signal.alarm(0)  # 取消超时
+                    
+            except (TimeoutError, Exception) as e:
+                if is_main_process() and self.logger:
+                    self.logger.warning(f"⚠️ 保存状态时分布式同步失败: {e}，继续保存...")
         
+        # 只在主进程保存状态
         if not is_main_process():
             return
             
@@ -415,15 +440,26 @@ class GANTrainer:
         generator_state = self.generator.module.state_dict() if self.is_distributed else self.generator.state_dict()
         discriminator_state = self.discriminator.module.state_dict() if self.is_distributed else self.discriminator.state_dict()
         
-        torch.save({
-            'epoch': epoch,
-            'generator_state_dict': generator_state,
-            'discriminator_state_dict': discriminator_state,
-            'optimizer_G_state_dict': self.optimizer_G.state_dict(),
-            'optimizer_D_state_dict': self.optimizer_D.state_dict(),
-            'scheduler_G_state_dict': self.scheduler_G.state_dict(),
-            'scheduler_D_state_dict': self.scheduler_D.state_dict(),
-        }, checkpoint_path)
+        try:
+            torch.save({
+                'epoch': epoch,
+                'generator_state_dict': generator_state,
+                'discriminator_state_dict': discriminator_state,
+                'optimizer_G_state_dict': self.optimizer_G.state_dict(),
+                'optimizer_D_state_dict': self.optimizer_D.state_dict(),
+                'scheduler_G_state_dict': self.scheduler_G.state_dict(),
+                'scheduler_D_state_dict': self.scheduler_D.state_dict(),
+            }, checkpoint_path)
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"❌ 保存checkpoint失败: {e}")
+                # 尝试保存简化版本
+                try:
+                    torch.save(generator_state, os.path.join(self.train_epoch_dir, f'generator_backup_epoch_{epoch}.pth'))
+                    torch.save(discriminator_state, os.path.join(self.train_epoch_dir, f'discriminator_backup_epoch_{epoch}.pth'))
+                    self.logger.info(f"✅ 已保存简化版本的模型文件")
+                except Exception as e2:
+                    self.logger.error(f"❌ 保存简化版本也失败: {e2}")
 
     def load_state(self):
         # 这个方法现在已经被_load_models_unified替代，保留是为了兼容性
@@ -478,7 +514,9 @@ class GANTrainer:
                 sampler=train_sampler,
                 num_workers=0,
                 collate_fn=collate_fn,
-                pin_memory=True
+                pin_memory=False,  # 修改：禁用pin_memory避免潜在的死锁
+                persistent_workers=False,  # 新增：禁用持久化worker
+                prefetch_factor=2  # 新增：减少预取因子
             )
             val_dataloader = DataLoader(
                 val_dataset, 
@@ -486,7 +524,9 @@ class GANTrainer:
                 sampler=val_sampler,
                 num_workers=0,
                 collate_fn=collate_fn,
-                pin_memory=True
+                pin_memory=False,  # 修改：禁用pin_memory避免潜在的死锁
+                persistent_workers=False,  # 新增：禁用持久化worker
+                prefetch_factor=2  # 新增：减少预取因子
             )
         else:
             # 非分布式训练
@@ -577,7 +617,10 @@ class GANTrainer:
                     self.train_dataloader.sampler.set_epoch(epoch)
                 
                 for i, data in enumerate(self.train_dataloader, 0):
-                    real_cpu = data[0].to(self.device)
+                    if is_main_process() and self.logger and i == 0:
+                        self.logger.info(f"🔄 开始第 {epoch} 轮训练，预计有 {len(self.train_dataloader)} 个batch")
+                    
+                    real_cpu = data[0].to(self.device, non_blocking=True)  # 修改：使用non_blocking传输
                     b_size = real_cpu.size(0)
                     
                     # 计算当前是否为累积步骤的开始和结束
@@ -645,15 +688,11 @@ class GANTrainer:
                         self.scaler.step(self.optimizer_G)
                         self.scaler.update()
 
-                    # 只在主进程记录日志，改为更频繁的日志记录
-                    if i % 10 == 0 and is_main_process() and self.logger:
+                    # 只在主进程记录日志，减少频率
+                    if i % 50 == 0 and is_main_process() and self.logger:  # 修改：从每10个batch改为每50个batch
                         self.logger.debug('[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z)): %.4f / %.4f'
                                      % (epoch, self.epochs, i, len(self.train_dataloader),
                                         errD.item() * self.gradient_accumulation_steps, errG.item() * self.gradient_accumulation_steps, D_x, D_G_z1, D_G_z2))
-
-                    # 增加更频繁的进度日志，每个batch都输出
-                    if is_main_process() and self.logger:
-                        self.logger.info(f"📊 Batch [{i+1}/{len(self.train_dataloader)}] 完成")
 
                     # 在主进程中记录损失（恢复原始损失值）
                     if is_main_process():
@@ -667,8 +706,12 @@ class GANTrainer:
 
                     iters += 1
                 
-                # 添加CUDA内存调试信息（每10个batch输出一次）
-                if torch.cuda.is_available() and is_main_process() and self.logger and (iters % 10 == 0):
+                # 添加更好的调试信息 - 每个epoch完成的batch数
+                if is_main_process() and self.logger:
+                    self.logger.info(f"✅ Epoch {epoch} 完成，处理了 {len(self.train_dataloader)} 个batch")
+                
+                # 添加CUDA内存调试信息（每个epoch结束时输出一次）
+                if torch.cuda.is_available() and is_main_process() and self.logger:
                     memory_allocated = torch.cuda.memory_allocated(self.device) / 1024**3  # GB
                     memory_reserved = torch.cuda.memory_reserved(self.device) / 1024**3   # GB
                     self.logger.info(f"💾 CUDA内存使用: {memory_allocated:.2f}GB / {memory_reserved:.2f}GB")
@@ -677,21 +720,35 @@ class GANTrainer:
                 if is_main_process() and self.logger:
                     self.logger.info(f"📊 Epoch {epoch} 训练循环完成，准备进入保存和验证阶段...")
 
-                # 同步所有进程
-                if self.is_distributed:
+                # 同步所有进程 - 修复同步逻辑
+                if self.is_distributed and dist.is_initialized():
                     if is_main_process() and self.logger:
                         self.logger.info(f"🔄 等待所有进程完成 epoch {epoch}...")
                     try:
-                        # 使用超时的barrier，避免无限等待
+                        # 添加超时机制，但只在Unix系统上使用signal
+                        import signal
+                        def timeout_handler(signum, frame):
+                            raise TimeoutError("分布式同步超时")
+                        
+                        if hasattr(signal, 'SIGALRM'):  # Unix系统
+                            signal.signal(signal.SIGALRM, timeout_handler)
+                            signal.alarm(30)  # 30秒超时
+                        
                         dist.barrier()
+                        
+                        if hasattr(signal, 'SIGALRM'):
+                            signal.alarm(0)  # 取消超时
+                            
                         if is_main_process() and self.logger:
                             self.logger.info(f"✅ 所有进程已同步完成 epoch {epoch}")
-                    except Exception as e:
+                    except (TimeoutError, Exception) as e:
                         if is_main_process() and self.logger:
                             self.logger.error(f"❌ 分布式同步失败: {e}")
                             self.logger.info(f"🔄 尝试跳过同步继续训练...")
+                        # 清除CUDA缓存，尝试恢复
+                        torch.cuda.empty_cache()
 
-                #在训练循环中，每个epoch结束时，调用save_state方法来保存状态：
+                # 保存训练状态
                 if is_main_process() and self.logger:
                     self.logger.info(f"💾 开始保存 epoch {epoch} 状态...")
                 self.save_state(epoch)
@@ -763,12 +820,16 @@ class GANTrainer:
                     val_loss /= len(self.val_dataloader)
                     
                     # 在分布式训练中同步验证损失
-                    if self.is_distributed:
+                    if self.is_distributed and dist.is_initialized():
                         if is_main_process() and self.logger:
                             self.logger.info(f"🔄 同步验证损失...")
-                        val_loss_tensor = torch.tensor(val_loss, device=self.device)
-                        dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
-                        val_loss = val_loss_tensor.item() / self.world_size
+                        try:
+                            val_loss_tensor = torch.tensor(val_loss, device=self.device)
+                            dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
+                            val_loss = val_loss_tensor.item() / self.world_size
+                        except Exception as e:
+                            if is_main_process() and self.logger:
+                                self.logger.warning(f"⚠️ 验证损失同步失败: {e}，使用本地值")
                     
                     if is_main_process() and self.logger:
                         self.logger.debug(f'训练到第{epoch}个周期后的验证损失为: {val_loss}')
@@ -814,16 +875,20 @@ class GANTrainer:
                             should_stop = True
                     
                     # 在分布式训练中同步早停决定和计数器
-                    if self.is_distributed:
-                        # 同步should_stop
-                        should_stop_tensor = torch.tensor(int(should_stop), device=self.device)
-                        dist.all_reduce(should_stop_tensor, op=dist.ReduceOp.MAX)
-                        should_stop = bool(should_stop_tensor.item())
-                        
-                        # 同步early_stopping_counter
-                        counter_tensor = torch.tensor(early_stopping_counter, device=self.device)
-                        dist.all_reduce(counter_tensor, op=dist.ReduceOp.MAX)
-                        early_stopping_counter = counter_tensor.item()
+                    if self.is_distributed and dist.is_initialized():
+                        try:
+                            # 同步should_stop
+                            should_stop_tensor = torch.tensor(int(should_stop), device=self.device)
+                            dist.all_reduce(should_stop_tensor, op=dist.ReduceOp.MAX)
+                            should_stop = bool(should_stop_tensor.item())
+                            
+                            # 同步early_stopping_counter
+                            counter_tensor = torch.tensor(early_stopping_counter, device=self.device)
+                            dist.all_reduce(counter_tensor, op=dist.ReduceOp.MAX)
+                            early_stopping_counter = counter_tensor.item()
+                        except Exception as e:
+                            if is_main_process() and self.logger:
+                                self.logger.warning(f"⚠️ 早停同步失败: {e}，使用本地值")
                     
                     if should_stop:
                         if is_main_process() and self.logger:
@@ -907,6 +972,10 @@ class GANTrainer:
 
 
 if __name__ == '__main__':
+    # 首先设置分布式环境以确定是否为主进程
+    temp_is_distributed, temp_rank, temp_world_size, temp_local_rank = setup_distributed()
+    temp_is_main = not temp_is_distributed or temp_rank == 0
+    
     # 添加命令行参数解析
     parser = argparse.ArgumentParser(description='GAN训练器 - 支持分布式训练')
     parser.add_argument('--train_dir', type=str, default='./dataset', 
@@ -949,8 +1018,8 @@ if __name__ == '__main__':
     # 也支持从环境变量获取数据集路径（向后兼容）
     dataset_path = os.getenv('DATASET_PATH', args.train_dir)
     
-    # 在主进程中打印配置信息
-    if is_main_process():
+    # 只在主进程中打印配置信息
+    if temp_is_main:
         print(f"🚀 启动GAN训练器")
         print(f"📁 数据集路径: {dataset_path}")
         print(f"🔄 训练轮数: {args.epochs}")
@@ -962,6 +1031,8 @@ if __name__ == '__main__':
         print(f"🔄 加载预训练模型: {args.load_models}")
         if args.start_epoch > 0:
             print(f"▶️  从第 {args.start_epoch} 轮开始训练")
+        if temp_is_distributed:
+            print(f"🌐 分布式训练模式：总进程数 {temp_world_size}")
     
     trainer = GANTrainer(
         dataset_path=dataset_path,
@@ -983,11 +1054,11 @@ if __name__ == '__main__':
     try:
         trainer.train()
     except Exception as e:
-        if is_main_process():
+        if temp_is_main:
             print(f"❌ 训练过程中发生错误: {e}")
         raise
     finally:
         # 清理分布式训练环境
         cleanup_distributed()
-        if is_main_process():
+        if temp_is_main:
             print("🧹 分布式训练环境已清理")
