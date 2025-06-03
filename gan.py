@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-GAN训练器 - 支持emoji符号和Unicode字符，支持分布式训练
+GAN训练器 - 支持emoji符号和Unicode字符 + DDP分布式训练
 使用UTF-8编码确保所有字符正确显示和保存
+支持单机多卡和多机多卡的分布式训练
 """
 
 import torch
@@ -11,7 +12,6 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torchvision.utils import save_image
 import torchvision.utils as vutils
 from torch.utils.data import random_split
@@ -58,37 +58,29 @@ def safe_emoji(emoji_text, fallback_text):
     except UnicodeEncodeError:
         return fallback_text
 
-def setup_distributed(rank, world_size, backend='nccl'):
+def setup_distributed():
     """设置分布式训练环境"""
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '12355'
-    
-    # 初始化进程组
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
-    
-    # 设置当前进程的GPU
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        
+        # 初始化进程组
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        torch.cuda.set_device(local_rank)
+        
+        return True, rank, world_size, local_rank
+    else:
+        return False, 0, 1, 0
 
 def cleanup_distributed():
     """清理分布式训练环境"""
-    dist.destroy_process_group()
-
-def get_world_size():
-    """获取总进程数"""
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_world_size()
-    return 1
-
-def get_rank():
-    """获取当前进程的rank"""
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank()
-    return 0
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 def is_main_process():
     """判断是否为主进程"""
-    return get_rank() == 0
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 # 在模块加载时立即设置UTF-8环境
 setup_utf8_environment()
@@ -96,12 +88,17 @@ setup_utf8_environment()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def collate_fn(batch):
-    """批量数据整理函数，保持数据在CPU上，避免与pin_memory冲突"""
+    """批量数据整理函数，确保数据在正确的设备上，支持分布式训练"""
     images, labels = zip(*batch)
+    # 在分布式训练中使用当前设备
+    if dist.is_initialized():
+        device = torch.cuda.current_device()
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 不在这里移动到GPU，保持在CPU上避免与pin_memory冲突
-    images = torch.stack(images)
-    labels = torch.tensor(labels)
+    images = torch.stack([img.to(device) for img in images])
+    # 将标签转换为tensor并移动到设备
+    labels = torch.tensor(labels, device=device)
     return images, labels
 
 class MyDataset(Dataset):
@@ -159,8 +156,11 @@ class Discriminator(nn.Module):
 
 class GANTrainer:
     def __init__(self, dataset_path, latent_dim=100, lr_G=0.0002, lr_D=0.0002, betas=(0.5, 0.999), batch_size=128, image_size=64,
-                 epochs=50,start_epoch=0,patience=5, min_delta=0.0001, num_layers=4, base_channels=64, load_models=False,gradient_accumulation_steps=1, validation_frequency=10, 
-                 distributed=False, rank=0, world_size=1):
+                 epochs=50,start_epoch=0,patience=5, min_delta=0.0001, num_layers=4, base_channels=64, load_models=False,gradient_accumulation_steps=1, validation_frequency=10):
+        
+        # 设置分布式训练
+        self.is_distributed, self.rank, self.world_size, self.local_rank = setup_distributed()
+        
         self.dataset_path = dataset_path
         self.latent_dim = latent_dim
         self.lr_G = lr_G
@@ -177,34 +177,31 @@ class GANTrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.validation_frequency = validation_frequency  # 新增验证频率参数，与patience语义分离
         self.load_models = load_models  # 保存加载模型标志
-        self.distributed = distributed  # 分布式训练标志
-        self.rank = rank  # 当前进程rank
-        self.world_size = world_size  # 总进程数
         self.best_val_loss = float('inf')  # 设置一个初始值，例如正无穷大
 
-        # 设置设备，支持分布式训练
-        if self.distributed and torch.cuda.is_available():
-            self.device = torch.device(f'cuda:{self.rank}')
+        # 设置设备
+        if self.is_distributed:
+            self.device = torch.device(f'cuda:{self.local_rank}')
+            torch.cuda.set_device(self.local_rank)
         else:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # 统一Logger管理 - 只在主进程创建logger
         if is_main_process():
             self.logger = self._setup_logger()
-            self.logger.debug(f'当前使用的设备是：{self.device}')
-            if self.distributed:
-                self.logger.info(f'{safe_emoji("🌐", "[DISTRIBUTED]")} 分布式训练模式：Rank {self.rank}/{self.world_size-1}')
+            self.logger.debug(f'{safe_emoji("💻", "[DEVICE]")} 当前使用的设备是：{self.device}')
+            if self.is_distributed:
+                self.logger.info(f'{safe_emoji("🌐", "[DDP]")} 分布式训练模式：Rank {self.rank}/{self.world_size}, Local Rank: {self.local_rank}')
         else:
-            # 非主进程使用简单的logger或者None
-            self.logger = self._setup_simple_logger()
+            self.logger = None
 
         self.generator = Generator(latent_dim, num_layers, base_channels).to(self.device)
         self.discriminator = Discriminator(num_layers, base_channels).to(self.device)
 
-        # 分布式训练：包装模型
-        if self.distributed:
-            self.generator = DDP(self.generator, device_ids=[self.rank])
-            self.discriminator = DDP(self.discriminator, device_ids=[self.rank])
+        # 在分布式训练中同步BN层
+        if self.is_distributed:
+            self.generator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.generator)
+            self.discriminator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.discriminator)
 
         self.criterion = nn.BCEWithLogitsLoss()
         self.optimizer_G = torch.optim.AdamW(self.generator.parameters(), lr=self.lr_G, betas=betas)
@@ -213,10 +210,19 @@ class GANTrainer:
         self.scheduler_G = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer_G, T_max=self.epochs)
         self.scheduler_D = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer_D, T_max=self.epochs)
 
-        self.scaler = GradScaler('cuda' if torch.cuda.is_available() else 'cpu')  # 使用新的API格式
+        # 为DDP设置GradScaler
+        if self.is_distributed:
+            self.scaler = GradScaler('cuda')
+        else:
+            self.scaler = GradScaler('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.dataset = self.load_dataset()
         self.train_dataloader, self.val_dataloader = self.split_dataset()
+        
+        # 包装模型为DDP
+        if self.is_distributed:
+            self.generator = DDP(self.generator, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True)
+            self.discriminator = DDP(self.discriminator, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True)
         
         plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 
@@ -260,64 +266,49 @@ class GANTrainer:
         
         return logger
 
-    def _setup_simple_logger(self):
-        """为非主进程设置简单的logger"""
-        logger = logging.getLogger(f'{__name__}_{self.rank}')
-        logger.setLevel(logging.ERROR)  # 非主进程只记录错误
-        return logger
-
     def _load_models_unified(self):
-        """统一的模型加载方法，按优先级尝试不同的加载方式，支持分布式训练"""
+        """统一的模型加载方法，按优先级尝试不同的加载方式，支持DDP"""
         if not self.load_models:
-            if is_main_process():
+            if is_main_process() and self.logger:
                 self.logger.debug("未启用模型加载，使用随机初始化的模型")
             return 0
-            
-        # 只在主进程进行日志输出
-        def log_info(msg):
-            if is_main_process():
-                self.logger.info(msg)
-                
-        def log_warning(msg):
-            if is_main_process():
-                self.logger.warning(msg)
-                
-        def log_debug(msg):
-            if is_main_process():
-                self.logger.debug(msg)
             
         # 优先级1: 尝试加载完整的checkpoint
         checkpoint_path = os.path.join(self.train_epoch_dir, f'checkpoint_epoch_{self.start_epoch}to{self.epochs}.pth')
         if os.path.isfile(checkpoint_path):
             try:
-                # 在分布式训练中，map_location确保在正确的设备上加载
-                map_location = {'cuda:0': f'cuda:{self.rank}'} if self.distributed else None
+                # 在GPU上加载checkpoint
+                map_location = {'cuda:%d' % 0: 'cuda:%d' % self.local_rank} if self.is_distributed else None
                 checkpoint = torch.load(checkpoint_path, map_location=map_location)
                 
-                # 加载模型状态字典，处理DDP包装
-                if self.distributed:
-                    self.generator.module.load_state_dict(checkpoint['generator_state_dict'])
-                    self.discriminator.module.load_state_dict(checkpoint['discriminator_state_dict'])
-                else:
-                    self.generator.load_state_dict(checkpoint['generator_state_dict'])
-                    self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
-                    
+                # 获取实际的模型（剥离DDP包装）
+                generator_model = self.generator.module if self.is_distributed else self.generator
+                discriminator_model = self.discriminator.module if self.is_distributed else self.discriminator
+                
+                generator_model.load_state_dict(checkpoint['generator_state_dict'])
+                discriminator_model.load_state_dict(checkpoint['discriminator_state_dict'])
                 self.optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
                 self.optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
                 self.scheduler_G.load_state_dict(checkpoint['scheduler_G_state_dict'])
                 self.scheduler_D.load_state_dict(checkpoint['scheduler_D_state_dict'])
                 
                 recovered_epoch = checkpoint['epoch']
-                log_info(f"{safe_emoji('✅', '[SUCCESS]')} 成功从checkpoint恢复训练状态，上次训练到第{recovered_epoch}个epoch")
-                log_debug("生成器结构：\n%s" % self.generator)
-                log_debug("判别器结构：\n%s" % self.discriminator)
-                log_debug("生成器参数数量： %s" % sum(p.numel() for p in self.generator.parameters()))
-                log_debug("判别器参数数量： %s" % sum(p.numel() for p in self.discriminator.parameters()))
+                if is_main_process() and self.logger:
+                    self.logger.info(f"{safe_emoji('✅', '[SUCCESS]')} 成功从checkpoint恢复训练状态，上次训练到第{recovered_epoch}个epoch")
+                    self.logger.debug("生成器结构：\n%s", generator_model)
+                    self.logger.debug("判别器结构：\n%s", discriminator_model)
+                    self.logger.debug("生成器参数数量： %s", sum(p.numel() for p in generator_model.parameters()))
+                    self.logger.debug("判别器参数数量： %s", sum(p.numel() for p in discriminator_model.parameters()))
+                
+                # 同步所有进程
+                if self.is_distributed:
+                    dist.barrier()
                 
                 return recovered_epoch + 1  # 返回下一个要训练的epoch
                 
             except Exception as e:
-                log_warning(f"{safe_emoji('⚠️', '[WARNING]')} Checkpoint加载失败：{e}")
+                if is_main_process() and self.logger:
+                    self.logger.warning(f"{safe_emoji('⚠️', '[WARNING]')} Checkpoint加载失败：{e}")
         
         # 优先级2: 尝试加载简单的模型文件
         generator_path = f'generator_simple_epoch_{self.start_epoch}to{self.epochs}.pth'
@@ -325,22 +316,29 @@ class GANTrainer:
         
         if os.path.isfile(generator_path) and os.path.isfile(discriminator_path):
             try:
-                map_location = {'cuda:0': f'cuda:{self.rank}'} if self.distributed else None
+                map_location = {'cuda:%d' % 0: 'cuda:%d' % self.local_rank} if self.is_distributed else None
                 
-                if self.distributed:
-                    self.generator.module.load_state_dict(torch.load(generator_path, map_location=map_location))
-                    self.discriminator.module.load_state_dict(torch.load(discriminator_path, map_location=map_location))
-                else:
-                    self.generator.load_state_dict(torch.load(generator_path, map_location=map_location))
-                    self.discriminator.load_state_dict(torch.load(discriminator_path, map_location=map_location))
-                    
-                log_info(f"{safe_emoji('✅', '[SUCCESS]')} 成功加载简单模型文件，从第{self.start_epoch}个epoch开始训练")
-                log_debug("生成器结构：\n%s" % self.generator)
-                log_debug("判别器结构：\n%s" % self.discriminator)
+                # 获取实际的模型（剥离DDP包装）
+                generator_model = self.generator.module if self.is_distributed else self.generator
+                discriminator_model = self.discriminator.module if self.is_distributed else self.discriminator
+                
+                generator_model.load_state_dict(torch.load(generator_path, map_location=map_location))
+                discriminator_model.load_state_dict(torch.load(discriminator_path, map_location=map_location))
+                
+                if is_main_process() and self.logger:
+                    self.logger.info(f"{safe_emoji('✅', '[SUCCESS]')} 成功加载简单模型文件，从第{self.start_epoch}个epoch开始训练")
+                    self.logger.debug("生成器结构：\n%s", generator_model)
+                    self.logger.debug("判别器结构：\n%s", discriminator_model)
+                
+                # 同步所有进程
+                if self.is_distributed:
+                    dist.barrier()
+                
                 return self.start_epoch
                 
             except Exception as e:
-                log_warning(f"{safe_emoji('⚠️', '[WARNING]')} 简单模型加载失败：{e}")
+                if is_main_process() and self.logger:
+                    self.logger.warning(f"{safe_emoji('⚠️', '[WARNING]')} 简单模型加载失败：{e}")
         
         # 优先级3: 寻找其他可用的checkpoint文件
         checkpoint_pattern = os.path.join(self.train_epoch_dir, 'checkpoint_epoch_*.pth')
@@ -350,58 +348,70 @@ class GANTrainer:
             # 选择最新的checkpoint文件
             latest_checkpoint = max(checkpoint_files, key=os.path.getctime)
             try:
-                map_location = {'cuda:0': f'cuda:{self.rank}'} if self.distributed else None
+                map_location = {'cuda:%d' % 0: 'cuda:%d' % self.local_rank} if self.is_distributed else None
                 checkpoint = torch.load(latest_checkpoint, map_location=map_location)
                 
-                if self.distributed:
-                    self.generator.module.load_state_dict(checkpoint['generator_state_dict'])
-                    self.discriminator.module.load_state_dict(checkpoint['discriminator_state_dict'])
-                else:
-                    self.generator.load_state_dict(checkpoint['generator_state_dict'])
-                    self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
-                    
+                # 获取实际的模型（剥离DDP包装）
+                generator_model = self.generator.module if self.is_distributed else self.generator
+                discriminator_model = self.discriminator.module if self.is_distributed else self.discriminator
+                
+                generator_model.load_state_dict(checkpoint['generator_state_dict'])
+                discriminator_model.load_state_dict(checkpoint['discriminator_state_dict'])
                 self.optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
                 self.optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
                 self.scheduler_G.load_state_dict(checkpoint['scheduler_G_state_dict'])
                 self.scheduler_D.load_state_dict(checkpoint['scheduler_D_state_dict'])
                 
                 recovered_epoch = checkpoint['epoch']
-                log_info(f"{safe_emoji('✅', '[SUCCESS]')} 找到并加载了其他checkpoint文件：{os.path.basename(latest_checkpoint)}")
-                log_info(f"恢复到第{recovered_epoch}个epoch")
+                if is_main_process() and self.logger:
+                    self.logger.info(f"{safe_emoji('✅', '[SUCCESS]')} 找到并加载了其他checkpoint文件：{os.path.basename(latest_checkpoint)}")
+                    self.logger.info(f"恢复到第{recovered_epoch}个epoch")
+                
+                # 同步所有进程
+                if self.is_distributed:
+                    dist.barrier()
+                
                 return recovered_epoch + 1
                 
             except Exception as e:
-                log_warning(f"{safe_emoji('⚠️', '[WARNING]')} 其他checkpoint加载失败：{e}")
+                if is_main_process() and self.logger:
+                    self.logger.warning(f"{safe_emoji('⚠️', '[WARNING]')} 其他checkpoint加载失败：{e}")
         
         # 所有加载方式都失败
-        log_info(f"{safe_emoji('ℹ️', '[INFO]')} 未找到可用的预训练模型，将从头开始训练")
+        if is_main_process() and self.logger:
+            self.logger.info(f"{safe_emoji('ℹ️', '[INFO]')} 未找到可用的预训练模型，将从头开始训练")
+        
+        # 同步所有进程
+        if self.is_distributed:
+            dist.barrier()
+        
         return 0
 
-    #保存生成器和判别器所有数据的模型 - 支持分布式训练
+    #保存生成器和判别器所有数据的模型，支持DDP
     def save_state(self, epoch):
-        """保存训练状态，只在主进程执行"""
+        """保存训练状态，支持DDP模型"""
         if not is_main_process():
             return
             
         checkpoint_path = os.path.join(self.train_epoch_dir, f'checkpoint_epoch_{self.start_epoch}to{self.epochs}.pth')
         
-        # 获取模型状态字典，处理DDP包装
-        if self.distributed:
-            generator_state_dict = self.generator.module.state_dict()
-            discriminator_state_dict = self.discriminator.module.state_dict()
-        else:
-            generator_state_dict = self.generator.state_dict()
-            discriminator_state_dict = self.discriminator.state_dict()
-            
+        # 获取实际的模型状态（剥离DDP包装）
+        generator_state = self.generator.module.state_dict() if self.is_distributed else self.generator.state_dict()
+        discriminator_state = self.discriminator.module.state_dict() if self.is_distributed else self.discriminator.state_dict()
+        
         torch.save({
             'epoch': epoch,
-            'generator_state_dict': generator_state_dict,
-            'discriminator_state_dict': discriminator_state_dict,
+            'generator_state_dict': generator_state,
+            'discriminator_state_dict': discriminator_state,
             'optimizer_G_state_dict': self.optimizer_G.state_dict(),
             'optimizer_D_state_dict': self.optimizer_D.state_dict(),
             'scheduler_G_state_dict': self.scheduler_G.state_dict(),
             'scheduler_D_state_dict': self.scheduler_D.state_dict(),
         }, checkpoint_path)
+        
+        # 同步所有进程
+        if self.is_distributed:
+            dist.barrier()
 
     def load_state(self):
         # 这个方法现在已经被_load_models_unified替代，保留是为了兼容性
@@ -430,52 +440,57 @@ class GANTrainer:
         return dataset
 
     def split_dataset(self):
-        """拆分数据集，支持分布式训练"""
+        """数据集分割，支持分布式采样"""
         train_size = int(0.8 * len(self.dataset))
         val_size = len(self.dataset) - train_size
         train_dataset, val_dataset = random_split(self.dataset, [train_size, val_size])
         
-        # 设置分布式训练友好的DataLoader配置
-        num_workers = 0 if self.distributed else 4  # 分布式训练使用0个worker
-        pin_memory = torch.cuda.is_available() and not self.distributed  # 分布式时禁用pin_memory
-        
-        # 分布式训练：使用DistributedSampler
-        if self.distributed:
-            train_sampler = DistributedSampler(train_dataset, num_replicas=self.world_size, rank=self.rank)
-            val_sampler = DistributedSampler(val_dataset, num_replicas=self.world_size, rank=self.rank)
+        if self.is_distributed:
+            # 分布式采样器
+            train_sampler = DistributedSampler(
+                train_dataset, 
+                num_replicas=self.world_size, 
+                rank=self.rank,
+                shuffle=True
+            )
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False
+            )
             
             train_dataloader = DataLoader(
                 train_dataset, 
                 batch_size=self.batch_size, 
                 sampler=train_sampler,
-                num_workers=num_workers,
+                num_workers=0,
                 collate_fn=collate_fn,
-                pin_memory=pin_memory  # 分布式训练中禁用pin_memory
+                pin_memory=True
             )
             val_dataloader = DataLoader(
                 val_dataset, 
                 batch_size=self.batch_size, 
                 sampler=val_sampler,
-                num_workers=num_workers,
+                num_workers=0,
                 collate_fn=collate_fn,
-                pin_memory=pin_memory  # 分布式训练中禁用pin_memory
+                pin_memory=True
             )
         else:
+            # 非分布式训练
             train_dataloader = DataLoader(
                 train_dataset, 
                 batch_size=self.batch_size, 
                 shuffle=True, 
-                num_workers=num_workers,
-                collate_fn=collate_fn,
-                pin_memory=pin_memory
+                num_workers=0,
+                collate_fn=collate_fn
             )
             val_dataloader = DataLoader(
                 val_dataset, 
                 batch_size=self.batch_size, 
                 shuffle=False, 
-                num_workers=num_workers,
-                collate_fn=collate_fn,
-                pin_memory=pin_memory
+                num_workers=0,
+                collate_fn=collate_fn
             )
         
         return train_dataloader, val_dataloader
@@ -511,13 +526,12 @@ class GANTrainer:
                 plt.close()
 
     def train(self):
-        """训练方法，支持分布式训练"""
+
         start_time = time.time()
-        
-        if is_main_process():
+        if is_main_process() and self.logger:
             self.logger.debug(f'{safe_emoji("🚀", "[START]")} 开始训练的时间为：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
 
-        # 只在主进程创建存储生成图片的目录
+        # 创建存储生成图片的目录（只在主进程）
         if is_main_process() and not os.path.exists(os.path.join(self.train_epoch_dir, 'fake_images_new')):
             os.makedirs(os.path.join(self.train_epoch_dir, 'fake_images_new'))
 
@@ -530,9 +544,9 @@ class GANTrainer:
         iters = 0
         early_stopping_counter = 0
 
-        if is_main_process():
+        if is_main_process() and self.logger:
             self.logger.debug(f'{safe_emoji("🔥", "")}{"<" * 30}开始训练{">" * 30}{safe_emoji("🔥", "")}')
-            
+        
         self.generator.train()
         self.discriminator.train()
         
@@ -540,16 +554,16 @@ class GANTrainer:
         start_epoch = self._load_models_unified()
         self.start_epoch = start_epoch
         
-        # 在分布式训练中同步所有进程
-        if self.distributed:
-            dist.barrier()
+        # 在分布式训练中设置epoch（用于DistributedSampler）
+        if self.is_distributed and hasattr(self.train_dataloader.sampler, 'set_epoch'):
+            self.train_dataloader.sampler.set_epoch(start_epoch)
         
         try:
             for epoch in range(start_epoch, self.epochs):
-                # 在分布式训练中，设置sampler的epoch
-                if self.distributed:
+                # 为分布式采样器设置epoch
+                if self.is_distributed and hasattr(self.train_dataloader.sampler, 'set_epoch'):
                     self.train_dataloader.sampler.set_epoch(epoch)
-                    
+                
                 for i, data in enumerate(self.train_dataloader, 0):
                     real_cpu = data[0].to(self.device)
                     b_size = real_cpu.size(0)
@@ -582,7 +596,7 @@ class GANTrainer:
                     D_G_z1 = output.mean().item()
                     errD = errD_real + errD_fake
                     
-                    # 梯度累积处理 - 简化逻辑
+                    # 梯度累积处理
                     if (i + 1) % self.gradient_accumulation_steps == 0:
                         self.scaler.step(self.optimizer_D)
                         self.scaler.update()
@@ -601,37 +615,38 @@ class GANTrainer:
                     self.scaler.scale(errG).backward()
                     D_G_z2 = output.mean().item()
 
-                    # 梯度累积处理 - 简化逻辑
+                    # 梯度累积处理
                     if (i + 1) % self.gradient_accumulation_steps == 0:
                         self.scaler.step(self.optimizer_G)
                         self.scaler.update()
                         self.generator.zero_grad()
 
-                    # 只在主进程输出训练日志
-                    if i % 50 == 0 and is_main_process():
+                    # 只在主进程记录日志
+                    if i % 50 == 0 and is_main_process() and self.logger:
                         self.logger.debug('[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z)): %.4f / %.4f'
                                      % (epoch, self.epochs, i, len(self.train_dataloader),
                                         errD.item(), errG.item(), D_x, D_G_z1, D_G_z2))
 
-                    G_losses.append(errG.item())
-                    D_losses.append(errD.item())
+                    # 在主进程中记录损失
+                    if is_main_process():
+                        G_losses.append(errG.item())
+                        D_losses.append(errD.item())
 
-                    # 只在主进程保存中间图像
-                    if is_main_process() and ((iters % 500 == 0) or ((epoch == self.epochs - 1) and (i == len(self.train_dataloader) - 1))):
+                    if ((iters % 500 == 0) or ((epoch == self.epochs - 1) and (i == len(self.train_dataloader) - 1))) and is_main_process():
                         with torch.no_grad():
                             fake = self.generator(fixed_noise.to(torch.float32)).detach().cpu()
                         img_list.append(vutils.make_grid(fake, padding=2, normalize=True))
 
                     iters += 1
 
-                # Epoch结束后的同步 - 只在epoch结束时同步一次
-                if self.distributed:
+                # 同步所有进程
+                if self.is_distributed:
                     dist.barrier()
 
                 #在训练循环中，每个epoch结束时，调用save_state方法来保存状态：
                 self.save_state(epoch)
 
-                # 只在主进程保存生成的图像
+                # 在每个epoch结束时保存生成的图像（只在主进程）
                 if is_main_process():
                     with torch.no_grad():
                         fake = self.generator(fixed_noise).detach().cpu()
@@ -642,8 +657,7 @@ class GANTrainer:
                 self.generator.eval()
                 self.discriminator.eval()
 
-                # 只在主进程显示图像
-                if epoch % 50 == 0 and is_main_process():
+                if epoch % 50==0 and is_main_process():
                     # 将生成的图像显示在控制台
                     plt.imshow(np.transpose(vutils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
                     plt.axis('off')
@@ -663,10 +677,8 @@ class GANTrainer:
                 if epoch % self.validation_frequency == 0:
                     self.generator.eval()
                     val_loss = 0
-                    
-                    # 在分布式训练中，所有进程都进行验证，但只有主进程输出日志
                     with torch.no_grad():
-                        for val_i, data in enumerate(self.val_dataloader, 0):
+                        for i, data in enumerate(self.val_dataloader, 0):
                             real_cpu = data[0].to(self.device)
                             b_size = real_cpu.size(0)
                             label = torch.full((b_size,), real_label, dtype=torch.float, device=self.device)
@@ -690,226 +702,125 @@ class GANTrainer:
                             val_loss += errG.item() + errD.item()
 
                     val_loss /= len(self.val_dataloader)
-                    
-                    # 只在主进程输出验证日志和进行早停检查
-                    if is_main_process():
-                        self.logger.debug(f'训练到第{epoch}个周期后的验证损失为: {val_loss}')
+                    self.logger.debug(f'训练到第{epoch}个周期后的验证损失为: {val_loss}')
 
-                        # 早停逻辑：如果验证损失改善，重置计数器
-                        if val_loss < self.best_val_loss - self.min_delta:
-                            self.best_val_loss = val_loss
-                            early_stopping_counter = 0
+                    # 早停逻辑：如果验证损失改善，重置计数器
+                    if val_loss < self.best_val_loss - self.min_delta:
+                        self.best_val_loss = val_loss
+                        early_stopping_counter = 0
 
-                            # 在每个epoch结束时保存此时的模型文件
-                            # 保存生成器的模型
-                            torch.save({
-                                'epoch': epoch,
-                                'generator_state_dict': self.generator.state_dict(),
-                                'optimizer_G_state_dict': self.optimizer_G.state_dict(),
-                                'scheduler_G_state_dict': self.scheduler_G.state_dict(),
-                                'best_val_loss': self.best_val_loss,
-                                'val_loss': val_loss,
-                                'early_stopping_counter': early_stopping_counter,
-                            },os.path.join(self.train_epoch_dir, f'generator_all_epoch_{start_epoch}to{self.epochs}.pth'))
+                        self.generator.train()
+                        self.discriminator.train()
 
-                            # 保存判别器的模型
-                            torch.save({
-                                'epoch': epoch,
-                                'discriminator_state_dict': self.discriminator.state_dict(),
-                                'optimizer_D_state_dict': self.optimizer_D.state_dict(),
-                                'scheduler_D_state_dict': self.scheduler_D.state_dict(),
-                                'best_val_loss': self.best_val_loss,
-                                'val_loss': val_loss,
-                                'early_stopping_counter': early_stopping_counter,
-                            },os.path.join(self.train_epoch_dir, f'discriminator_all_epoch_{start_epoch}to{self.epochs}.pth'))
+                        # 在每个epoch结束时保存此时的模型文件
+                        # 保存生成器的模型
+                        torch.save({
+                            'epoch': epoch,
+                            'generator_state_dict': self.generator.state_dict(),
+                            'optimizer_G_state_dict': self.optimizer_G.state_dict(),
+                            'scheduler_G_state_dict': self.scheduler_G.state_dict(),
+                            'best_val_loss': self.best_val_loss,
+                            'val_loss': val_loss,
+                            'early_stopping_counter': early_stopping_counter,
+                        },os.path.join(self.train_epoch_dir, f'generator_all_epoch_{start_epoch}to{self.epochs}.pth'))
 
-                        else:
-                            early_stopping_counter += 1
-                            self.logger.debug(f'训练到第{epoch}个周期后早停次数+1，当前早停次数为：{early_stopping_counter}.因为验证损失没有改善，或者改善的幅度小于min_delta')
-                            if early_stopping_counter >= self.patience:
-                                self.logger.debug(
-                                    f'训练到第{epoch}个周期后停止训练，因为早停次数大于等于耐心值：{self.patience}且验证损失没有改善，或者改善的幅度小于min_delta')
-                                break
+                        # 保存判别器的模型
+                        torch.save({
+                            'epoch': epoch,
+                            'discriminator_state_dict': self.discriminator.state_dict(),
+                            'optimizer_D_state_dict': self.optimizer_D.state_dict(),
+                            'scheduler_D_state_dict': self.scheduler_D.state_dict(),
+                            'best_val_loss': self.best_val_loss,
+                            'val_loss': val_loss,
+                            'early_stopping_counter': early_stopping_counter,
+                        },os.path.join(self.train_epoch_dir, f'discriminator_all_epoch_{start_epoch}to{self.epochs}.pth'))
 
-                    self.generator.train()
-                    self.discriminator.train()
-                    
-                    # 验证结束后的同步
-                    if self.distributed:
-                        dist.barrier()
+                    else:
+                        early_stopping_counter += 1
+                        self.logger.debug(f'训练到第{epoch}个周期后早停次数+1，当前早停次数为：{early_stopping_counter}.因为验证损失没有改善，或者改善的幅度小于min_delta')
+                        if early_stopping_counter >= self.patience:
+                            self.logger.debug(
+                                f'训练到第{epoch}个周期后停止训练，因为早停次数大于等于耐心值：{self.patience}且验证损失没有改善，或者改善的幅度小于min_delta')
+                            break
 
         except KeyboardInterrupt:
-            if is_main_process():
-                self.logger.info(f'\n{safe_emoji("🛑", "[STOP]")} 用户手动停止训练 (Epoch {epoch}) {safe_emoji("🛑", "[STOP]")}')
-                self.logger.info(f'{safe_emoji("💾", "[SAVE]")} 正在保存当前训练状态...')
-            
+            self.logger.info(f'\n{safe_emoji("🛑", "[STOP]")} 用户手动停止训练 (Epoch {epoch}) {safe_emoji("🛑", "[STOP]")}')
+            self.logger.info(f'{safe_emoji("💾", "[SAVE]")} 正在保存当前训练状态...')
             # 保存当前状态
             self.save_state(epoch)
-            
-            # 只在主进程保存简单模型
-            if is_main_process():
-                torch.save(self.generator.state_dict(), os.path.join(self.train_epoch_dir,f'generator_simple_epoch_{start_epoch}to{epoch}_interrupted.pth'))
-                torch.save(self.discriminator.state_dict(), os.path.join(self.train_epoch_dir,f'discriminator_simple_epoch_{start_epoch}to{epoch}_interrupted.pth'))
-                self.logger.info(f'{safe_emoji("✅", "[SUCCESS]")} 训练状态已保存！可以通过设置start_epoch={epoch+1}来恢复训练')
+            # 保存简单模型
+            torch.save(self.generator.state_dict(), os.path.join(self.train_epoch_dir,f'generator_simple_epoch_{start_epoch}to{epoch}_interrupted.pth'))
+            torch.save(self.discriminator.state_dict(), os.path.join(self.train_epoch_dir,f'discriminator_simple_epoch_{start_epoch}to{epoch}_interrupted.pth'))
+            self.logger.info(f'{safe_emoji("✅", "[SUCCESS]")} 训练状态已保存！可以通过设置start_epoch={epoch+1}来恢复训练')
             return G_losses, D_losses, img_list
 
-        if is_main_process():
-            self.logger.debug(f'{safe_emoji("🎉", "[COMPLETE]")} 训练结束！')
+        self.logger.debug(f'{safe_emoji("🎉", "[COMPLETE]")} 训练结束！')
 
-        # 只在主进程保存模型
-        if is_main_process():
-            torch.save(self.generator.state_dict(), os.path.join(self.train_epoch_dir,f'generator_simple_epoch_{start_epoch}to{self.epochs}.pth'))
-            torch.save(self.discriminator.state_dict(), os.path.join(self.train_epoch_dir,f'discriminator_simple_epoch_{start_epoch}to{self.epochs}.pth'))
+        # 保存模型
+        torch.save(self.generator.state_dict(), os.path.join(self.train_epoch_dir,f'generator_simple_epoch_{start_epoch}to{self.epochs}.pth'))
+        torch.save(self.discriminator.state_dict(), os.path.join(self.train_epoch_dir,f'discriminator_simple_epoch_{start_epoch}to{self.epochs}.pth'))
 
-        # 只在主进程绘制损失曲线
-        if is_main_process():
-            # 绘制损失曲线
-            plt.figure(figsize=(10, 5))
-            plt.title(f"Generator and Discriminator Loss During Training Between {start_epoch}To{self.epochs} Epoch \n训练期间生成器和判别器损耗")
-            plt.plot(G_losses, label="G生成器")
-            plt.plot(D_losses, label="D判别器")
-            plt.xlabel("iterations迭代")
-            plt.ylabel("Loss损耗")
-            plt.legend()
-            plt.show()
+        # 绘制损失曲线
+        plt.figure(figsize=(10, 5))
+        plt.title(f"Generator and Discriminator Loss During Training Between {start_epoch}To{self.epochs} Epoch \n训练期间生成器和判别器损耗")
+        plt.plot(G_losses, label="G生成器")
+        plt.plot(D_losses, label="D判别器")
+        plt.xlabel("iterations迭代")
+        plt.ylabel("Loss损耗")
+        plt.legend()
+        plt.show()
 
-            # 动态展示生成图片的过程
-            # 在创建动画之前设置embed_limit
-            plt.rcParams['animation.embed_limit'] = 30.0  # 或者设置适合你需求的值
+        # 动态展示生成图片的过程
+        # 在创建动画之前设置embed_limit
+        plt.rcParams['animation.embed_limit'] = 30.0  # 或者设置适合你需求的值
 
-            fig = plt.figure(figsize=(8, 8))
-            plt.axis("off")
-            ims = [[plt.imshow(np.transpose(i, (1, 2, 0)), animated=True)] for i in img_list]
-            ani = animation.ArtistAnimation(fig, ims, interval=1000, repeat_delay=1000, blit=True)
-            HTML(ani.to_jshtml())
+        fig = plt.figure(figsize=(8, 8))
+        plt.axis("off")
+        ims = [[plt.imshow(np.transpose(i, (1, 2, 0)), animated=True)] for i in img_list]
+        ani = animation.ArtistAnimation(fig, ims, interval=1000, repeat_delay=1000, blit=True)
+        HTML(ani.to_jshtml())
 
-            #另外保存生成图片的过程动画为html文件
+        #另外保存生成图片的过程动画为html文件
 
-            '''
-            它首先使用to_jshtml方法将动画转换为一个HTML字符串，然后将这个字符串写入到一个名为animation.html的文件中。
-            你可以在任何浏览器中打开这个文件来查看动画。
-            '''
+        '''
+        它首先使用to_jshtml方法将动画转换为一个HTML字符串，然后将这个字符串写入到一个名为animation.html的文件中。
+        你可以在任何浏览器中打开这个文件来查看动画。
+        '''
 
-            html = ani.to_jshtml()
-            with open(os.path.join(self.train_epoch_dir,f'animation_epoch_{self.start_epoch}to{self.epochs}.html'), 'w') as f:
-                f.write(html)
+        html = ani.to_jshtml()
+        with open(os.path.join(self.train_epoch_dir,f'animation_epoch_{self.start_epoch}to{self.epochs}.html'), 'w') as f:
 
-            # 可视化模型输出
-            self.visualize_model_output()
-            # 可视化权重
-            self.visualize_weights()
+            f.write(html)
 
-            self.logger.debug(f'{safe_emoji("🔥", "")}{"<" * 30}训练结束{">" * 30}{safe_emoji("🔥", "")}')
+        # 可视化模型输出
+        self.visualize_model_output()
+        # 可视化权重
+        self.visualize_weights()
 
-            # 计算耗时
-            end_time = time.time()
-            self.logger.debug(f'{safe_emoji("🏁", "[END]")} 结束训练的时间为：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
-            diff_time = end_time - start_time
-            hours = int(diff_time // 3600)
-            minutes = int((diff_time % 3600) // 60)
-            seconds = int(diff_time % 60)
-            self.logger.debug(f'{safe_emoji("⏱️", "[TIME]")} 训练总耗时：{hours}小时{minutes}分钟{seconds}秒')
-        
+        self.logger.debug(f'{safe_emoji("🔥", "")}{"<" * 30}训练结束{">" * 30}{safe_emoji("🔥", "")}')
+
+        # 计算耗时
+        end_time = time.time()
+        self.logger.debug(f'{safe_emoji("🏁", "[END]")} 结束训练的时间为：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
+        diff_time = end_time - start_time
+        hours = int(diff_time // 3600)
+        minutes = int((diff_time % 3600) // 60)
+        seconds = int(diff_time % 60)
+        self.logger.debug(f'{safe_emoji("⏱️", "[TIME]")} 训练总耗时：{hours}小时{minutes}分钟{seconds}秒')
         return G_losses, D_losses, img_list
-
-def launch_distributed_training(dataset_path, num_gpus=None, **kwargs):
-    """
-    启动分布式训练
-    
-    参数:
-        dataset_path: 数据集路径
-        num_gpus: 使用的GPU数量，如果为None则使用所有可用GPU
-        **kwargs: 传递给GANTrainer的其他参数
-    """
-    import torch.multiprocessing as mp
-    
-    if num_gpus is None:
-        num_gpus = torch.cuda.device_count()
-    
-    if num_gpus <= 1:
-        # 单GPU或CPU训练
-        trainer = GANTrainer(dataset_path=dataset_path, **kwargs)
-        return trainer.train()
-    else:
-        # 多GPU分布式训练
-        print(f"🚀 启动分布式训练，使用 {num_gpus} 个GPU")
-        mp.spawn(
-            _distributed_train_worker,
-            args=(num_gpus, dataset_path, kwargs),
-            nprocs=num_gpus,
-            join=True
-        )
-
-
-def _distributed_train_worker(rank, world_size, dataset_path, kwargs):
-    """
-    分布式训练工作进程
-    """
-    try:
-        print(f"[Rank {rank}] 开始初始化分布式训练工作进程...")
-        
-        # 设置分布式环境
-        setup_distributed(rank, world_size)
-        print(f"[Rank {rank}] 分布式环境设置完成")
-        
-        # 创建训练器并设置分布式参数
-        trainer = GANTrainer(
-            dataset_path=dataset_path,
-            distributed=True,
-            rank=rank,
-            world_size=world_size,
-            **kwargs
-        )
-        print(f"[Rank {rank}] 训练器创建完成")
-        
-        # 开始训练
-        trainer.train()
-        
-    except Exception as e:
-        import traceback
-        error_msg = f"[Rank {rank}] 分布式训练出错: {e}\n{traceback.format_exc()}"
-        print(error_msg)
-        raise e
-    finally:
-        try:
-            # 清理分布式环境
-            cleanup_distributed()
-            print(f"[Rank {rank}] 分布式环境清理完成")
-        except Exception as cleanup_e:
-            print(f"[Rank {rank}] 分布式环境清理失败: {cleanup_e}")
 
 
 if __name__ == '__main__':
     # 修改硬编码路径 - 使用相对路径或从环境变量获取
     dataset_path = os.getenv('DATASET_PATH', './dataset')  # 优先从环境变量获取，默认使用相对路径
-    
-    # 检查是否启用分布式训练
-    use_distributed = os.getenv('USE_DISTRIBUTED', 'false').lower() == 'true'
-    num_gpus = int(os.getenv('NUM_GPUS', '0')) if os.getenv('NUM_GPUS') else None
-    
-    if use_distributed:
-        # 启动分布式训练
-        launch_distributed_training(
-            dataset_path=dataset_path,
-            num_gpus=num_gpus,
-            num_layers=4,
-            base_channels=64,
-            load_models=True,
-            epochs=2000,
-            batch_size=256,
-            patience=500,
-            validation_frequency=10
-        )
-    else:
-        # 单机训练
-        trainer = GANTrainer(
-            dataset_path=dataset_path, 
-            num_layers=4, 
-            base_channels=64,
-            load_models=True, 
-            epochs=2000,
-            batch_size=256,
-            patience=500,
-            validation_frequency=10  # 新增参数：每10个epoch验证一次
-        )
-        trainer.train()
+    trainer = GANTrainer(
+        dataset_path=dataset_path, 
+        num_layers=4, 
+        base_channels=64,
+        load_models=True, 
+        epochs=2000,
+        batch_size=256,
+        patience=500,
+        validation_frequency=10  # 新增参数：每10个epoch验证一次
+    )
+    trainer.train()
