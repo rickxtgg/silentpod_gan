@@ -217,8 +217,8 @@ class GANTrainer:
         
         # 包装模型为DDP
         if self.is_distributed:
-            self.generator = DDP(self.generator, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True)
-            self.discriminator = DDP(self.discriminator, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True)
+            self.generator = DDP(self.generator, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=False)
+            self.discriminator = DDP(self.discriminator, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=False)
         
         plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 
@@ -582,7 +582,8 @@ class GANTrainer:
                         output = self.discriminator(real_cpu).view(-1)
                         errD_real = self.criterion(output, label)
                     
-                    # 混合精度训练的正确流程
+                    # 正确的梯度累积：除以累积步数
+                    errD_real = errD_real / self.gradient_accumulation_steps
                     self.scaler.scale(errD_real).backward()
                     D_x = output.mean().item()
 
@@ -594,6 +595,8 @@ class GANTrainer:
                         output = self.discriminator(fake.detach()).view(-1)
                         errD_fake = self.criterion(output, label)
                     
+                    # 正确的梯度累积：除以累积步数
+                    errD_fake = errD_fake / self.gradient_accumulation_steps
                     self.scaler.scale(errD_fake).backward()
                     D_G_z1 = output.mean().item()
                     errD = errD_real + errD_fake
@@ -616,6 +619,8 @@ class GANTrainer:
                         output = self.discriminator(fake).view(-1)
                         errG = self.criterion(output, label)
                     
+                    # 正确的梯度累积：除以累积步数
+                    errG = errG / self.gradient_accumulation_steps
                     self.scaler.scale(errG).backward()
                     D_G_z2 = output.mean().item()
 
@@ -624,16 +629,16 @@ class GANTrainer:
                         self.scaler.step(self.optimizer_G)
                         self.scaler.update()
 
-                    # 只在主进程记录日志
-                    if i % 50 == 0 and is_main_process() and self.logger:
+                    # 只在主进程记录日志，改为更频繁的日志记录
+                    if i % 10 == 0 and is_main_process() and self.logger:
                         self.logger.debug('[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z)): %.4f / %.4f'
                                      % (epoch, self.epochs, i, len(self.train_dataloader),
-                                        errD.item(), errG.item(), D_x, D_G_z1, D_G_z2))
+                                        errD.item() * self.gradient_accumulation_steps, errG.item() * self.gradient_accumulation_steps, D_x, D_G_z1, D_G_z2))
 
-                    # 在主进程中记录损失
+                    # 在主进程中记录损失（恢复原始损失值）
                     if is_main_process():
-                        G_losses.append(errG.item())
-                        D_losses.append(errD.item())
+                        G_losses.append(errG.item() * self.gradient_accumulation_steps)
+                        D_losses.append(errD.item() * self.gradient_accumulation_steps)
 
                     if ((iters % 500 == 0) or ((epoch == self.epochs - 1) and (i == len(self.train_dataloader) - 1))) and is_main_process():
                         with torch.no_grad():
@@ -641,26 +646,48 @@ class GANTrainer:
                         img_list.append(vutils.make_grid(fake, padding=2, normalize=True))
 
                     iters += 1
+                
+                # 强制CUDA同步，确保所有操作完成
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # 在主进程中输出epoch进度
+                if is_main_process() and self.logger:
+                    self.logger.info(f"📊 Epoch {epoch} 完成，进入保存和验证阶段...")
 
                 # 同步所有进程
                 if self.is_distributed:
+                    if is_main_process() and self.logger:
+                        self.logger.info(f"🔄 等待所有进程完成 epoch {epoch}...")
                     dist.barrier()
+                    if is_main_process() and self.logger:
+                        self.logger.info(f"✅ 所有进程已同步完成 epoch {epoch}")
 
                 #在训练循环中，每个epoch结束时，调用save_state方法来保存状态：
+                if is_main_process() and self.logger:
+                    self.logger.info(f"💾 开始保存 epoch {epoch} 状态...")
                 self.save_state(epoch)
+                if is_main_process() and self.logger:
+                    self.logger.info(f"✅ 已保存 epoch {epoch} 状态")
 
                 # 在每个epoch结束时保存生成的图像（只在主进程）
                 if is_main_process():
+                    if self.logger:
+                        self.logger.info(f"🎨 生成和保存 epoch {epoch} 的图像...")
                     with torch.no_grad():
                         fake = self.generator(fixed_noise).detach().cpu()
                     img_list.append(vutils.make_grid(fake, padding=2, normalize=True))
                     save_image(fake.data,os.path.join(self.train_epoch_dir, f'fake_images_new/fake_images_epoch_{epoch}_Loss_D_{errD.item():.4f}_Loss_G_{errG.item():.4f}_D_x_{D_x}_D_x_{(D_G_z1/D_G_z2):.4f}.png'), normalize=True)
+                    if self.logger:
+                        self.logger.info(f"✅ 已保存 epoch {epoch} 生成的图像")
 
                 # 在训练循环结束后，添加以下代码以打印生成器和判别器的损失并可视化生成的图像
                 self.generator.eval()
                 self.discriminator.eval()
 
                 if epoch % 50==0 and is_main_process():
+                    if self.logger:
+                        self.logger.info(f"📊 绘制 epoch {epoch} 的可视化图表...")
                     # 将生成的图像显示在控制台
                     plt.imshow(np.transpose(vutils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
                     plt.axis('off')
@@ -675,9 +702,13 @@ class GANTrainer:
                     plt.ylabel("Loss")
                     plt.legend()
                     #plt.show()
+                    if self.logger:
+                        self.logger.info(f"✅ 已完成 epoch {epoch} 的可视化")
 
                 # 修正验证逻辑：使用validation_frequency而不是patience作为验证频率
                 if epoch % self.validation_frequency == 0:
+                    if is_main_process() and self.logger:
+                        self.logger.info(f"🔍 开始 epoch {epoch} 的验证...")
                     self.generator.eval()
                     val_loss = 0
                     with torch.no_grad():
@@ -705,6 +736,8 @@ class GANTrainer:
                     
                     # 在分布式训练中同步验证损失
                     if self.is_distributed:
+                        if is_main_process() and self.logger:
+                            self.logger.info(f"🔄 同步验证损失...")
                         val_loss_tensor = torch.tensor(val_loss, device=self.device)
                         dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
                         val_loss = val_loss_tensor.item() / self.world_size
