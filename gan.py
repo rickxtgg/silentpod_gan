@@ -535,16 +535,12 @@ class GANTrainer:
         start_epoch = self._load_models_unified()
         self.start_epoch = start_epoch
         
-        # 在分布式训练中同步所有进程
-        if self.distributed:
-            dist.barrier()
-        
         try:
             for epoch in range(start_epoch, self.epochs):
-                # 在分布式训练中，设置sampler的epoch
-                if self.distributed:
+                # 在分布式训练中，为每个epoch设置sampler的epoch
+                if self.distributed and hasattr(self.train_dataloader.sampler, 'set_epoch'):
                     self.train_dataloader.sampler.set_epoch(epoch)
-                    
+
                 for i, data in enumerate(self.train_dataloader, 0):
                     real_cpu = data[0].to(self.device)
                     b_size = real_cpu.size(0)
@@ -619,9 +615,9 @@ class GANTrainer:
 
                     iters += 1
 
-                # 在分布式训练中同步所有进程
-                if self.distributed:
-                    dist.barrier()
+                # 每个epoch结束，不需要同步barrier，避免死锁
+                # if self.distributed:
+                #     dist.barrier()
 
                 #在训练循环中，每个epoch结束时，调用save_state方法来保存状态：
                 self.save_state(epoch)
@@ -659,36 +655,45 @@ class GANTrainer:
                     self.generator.eval()
                     val_loss = 0
                     
-                    # 在分布式训练中，只在主进程进行验证
-                    if is_main_process():
-                        with torch.no_grad():
-                            for i, data in enumerate(self.val_dataloader, 0):
-                                real_cpu = data[0].to(self.device)
-                                b_size = real_cpu.size(0)
-                                label = torch.full((b_size,), real_label, dtype=torch.float, device=self.device)
-                                output = self.discriminator(real_cpu).view(-1)
-                                errD_real = self.criterion(output, label)
-                                D_x = output.mean().item()
+                    # 在分布式训练中，所有进程都参与验证但只在主进程记录日志
+                    with torch.no_grad():
+                        for i, data in enumerate(self.val_dataloader, 0):
+                            real_cpu = data[0].to(self.device)
+                            b_size = real_cpu.size(0)
+                            label = torch.full((b_size,), real_label, dtype=torch.float, device=self.device)
+                            output = self.discriminator(real_cpu).view(-1)
+                            errD_real = self.criterion(output, label)
+                            D_x = output.mean().item()
 
-                                noise = torch.randn(b_size, self.latent_dim, 1, 1, device=self.device)
-                                fake = self.generator(noise)
-                                label.fill_(fake_label)
-                                output = self.discriminator(fake.detach()).view(-1)
-                                errD_fake = self.criterion(output, label)
-                                D_G_z1 = output.mean().item()
-                                errD = errD_real + errD_fake
+                            noise = torch.randn(b_size, self.latent_dim, 1, 1, device=self.device)
+                            fake = self.generator(noise)
+                            label.fill_(fake_label)
+                            output = self.discriminator(fake.detach()).view(-1)
+                            errD_fake = self.criterion(output, label)
+                            D_G_z1 = output.mean().item()
+                            errD = errD_real + errD_fake
 
-                                label.fill_(real_label)
-                                output = self.discriminator(fake).view(-1)
-                                errG = self.criterion(output, label)
-                                D_G_z2 = output.mean().item()
+                            label.fill_(real_label)
+                            output = self.discriminator(fake).view(-1)
+                            errG = self.criterion(output, label)
+                            D_G_z2 = output.mean().item()
 
-                                val_loss += errG.item() + errD.item()
+                            val_loss += errG.item() + errD.item()
 
                         val_loss /= len(self.val_dataloader)
-                        self.logger.debug(f'训练到第{epoch}个周期后的验证损失为: {val_loss}')
+                        
+                        # 分布式训练中同步验证损失
+                        if self.distributed:
+                            val_loss_tensor = torch.tensor(val_loss, device=self.device)
+                            dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
+                            val_loss = val_loss_tensor.item() / self.world_size
+                        
+                        # 只在主进程记录日志
+                        if is_main_process():
+                            self.logger.debug(f'训练到第{epoch}个周期后的验证损失为: {val_loss}')
 
-                        # 早停逻辑：如果验证损失改善，重置计数器
+                        # 早停逻辑：所有进程统一判断
+                        early_stop_decision = 0  # 0表示继续，1表示停止
                         if val_loss < self.best_val_loss - self.min_delta:
                             self.best_val_loss = val_loss
                             early_stopping_counter = 0
@@ -696,40 +701,59 @@ class GANTrainer:
                             self.generator.train()
                             self.discriminator.train()
 
-                            # 在每个epoch结束时保存此时的模型文件
-                            # 保存生成器的模型
-                            torch.save({
-                                'epoch': epoch,
-                                'generator_state_dict': self.generator.state_dict(),
-                                'optimizer_G_state_dict': self.optimizer_G.state_dict(),
-                                'scheduler_G_state_dict': self.scheduler_G.state_dict(),
-                                'best_val_loss': self.best_val_loss,
-                                'val_loss': val_loss,
-                                'early_stopping_counter': early_stopping_counter,
-                            },os.path.join(self.train_epoch_dir, f'generator_all_epoch_{start_epoch}to{self.epochs}.pth'))
+                            # 只在主进程保存模型
+                            if is_main_process():
+                                # 保存生成器的模型
+                                torch.save({
+                                    'epoch': epoch,
+                                    'generator_state_dict': self.generator.state_dict(),
+                                    'optimizer_G_state_dict': self.optimizer_G.state_dict(),
+                                    'scheduler_G_state_dict': self.scheduler_G.state_dict(),
+                                    'best_val_loss': self.best_val_loss,
+                                    'val_loss': val_loss,
+                                    'early_stopping_counter': early_stopping_counter,
+                                },os.path.join(self.train_epoch_dir, f'generator_all_epoch_{start_epoch}to{self.epochs}.pth'))
 
-                            # 保存判别器的模型
-                            torch.save({
-                                'epoch': epoch,
-                                'discriminator_state_dict': self.discriminator.state_dict(),
-                                'optimizer_D_state_dict': self.optimizer_D.state_dict(),
-                                'scheduler_D_state_dict': self.scheduler_D.state_dict(),
-                                'best_val_loss': self.best_val_loss,
-                                'val_loss': val_loss,
-                                'early_stopping_counter': early_stopping_counter,
-                            },os.path.join(self.train_epoch_dir, f'discriminator_all_epoch_{start_epoch}to{self.epochs}.pth'))
+                                # 保存判别器的模型
+                                torch.save({
+                                    'epoch': epoch,
+                                    'discriminator_state_dict': self.discriminator.state_dict(),
+                                    'optimizer_D_state_dict': self.optimizer_D.state_dict(),
+                                    'scheduler_D_state_dict': self.scheduler_D.state_dict(),
+                                    'best_val_loss': self.best_val_loss,
+                                    'val_loss': val_loss,
+                                    'early_stopping_counter': early_stopping_counter,
+                                },os.path.join(self.train_epoch_dir, f'discriminator_all_epoch_{start_epoch}to{self.epochs}.pth'))
 
                         else:
                             early_stopping_counter += 1
-                            self.logger.debug(f'训练到第{epoch}个周期后早停次数+1，当前早停次数为：{early_stopping_counter}.因为验证损失没有改善，或者改善的幅度小于min_delta')
+                            if is_main_process():
+                                self.logger.debug(f'训练到第{epoch}个周期后早停次数+1，当前早停次数为：{early_stopping_counter}.因为验证损失没有改善，或者改善的幅度小于min_delta')
                             if early_stopping_counter >= self.patience:
-                                self.logger.debug(
-                                    f'训练到第{epoch}个周期后停止训练，因为早停次数大于等于耐心值：{self.patience}且验证损失没有改善，或者改善的幅度小于min_delta')
+                                if is_main_process():
+                                    self.logger.debug(f'训练到第{epoch}个周期后停止训练，因为早停次数大于等于耐心值：{self.patience}且验证损失没有改善，或者改善的幅度小于min_delta')
+                                early_stop_decision = 1
+                        
+                        # 分布式训练中同步早停决定
+                        if self.distributed:
+                            early_stop_tensor = torch.tensor(early_stop_decision, device=self.device)
+                            dist.all_reduce(early_stop_tensor, op=dist.ReduceOp.MAX)
+                            if early_stop_tensor.item() > 0:
                                 break
+                        elif early_stop_decision:
+                            break
                     
-                    # 在分布式训练中同步所有进程
-                    if self.distributed:
-                        dist.barrier()
+                    # 恢复训练模式
+                    self.generator.train()
+                    self.discriminator.train()
+                    
+                # 在每个epoch结束时清理缓存
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                    
+                # 只在主进程输出进度信息  
+                if is_main_process():
+                    print(f"Epoch {epoch}/{self.epochs} 完成")
 
         except KeyboardInterrupt:
             if is_main_process():
