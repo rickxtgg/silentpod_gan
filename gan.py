@@ -435,6 +435,10 @@ class GANTrainer:
         val_size = len(self.dataset) - train_size
         train_dataset, val_dataset = random_split(self.dataset, [train_size, val_size])
         
+        # 设置分布式训练友好的DataLoader配置
+        num_workers = 0 if self.distributed else 4  # 分布式训练使用0个worker
+        pin_memory = torch.cuda.is_available() and not self.distributed  # 分布式时禁用pin_memory
+        
         # 分布式训练：使用DistributedSampler
         if self.distributed:
             train_sampler = DistributedSampler(train_dataset, num_replicas=self.world_size, rank=self.rank)
@@ -444,32 +448,34 @@ class GANTrainer:
                 train_dataset, 
                 batch_size=self.batch_size, 
                 sampler=train_sampler,
-                num_workers=0,  # 在分布式训练中使用单线程避免潜在问题
+                num_workers=num_workers,
                 collate_fn=collate_fn,
-                pin_memory=True if torch.cuda.is_available() else False
+                pin_memory=pin_memory  # 分布式训练中禁用pin_memory
             )
             val_dataloader = DataLoader(
                 val_dataset, 
                 batch_size=self.batch_size, 
                 sampler=val_sampler,
-                num_workers=0,  # 在分布式训练中使用单线程
+                num_workers=num_workers,
                 collate_fn=collate_fn,
-                pin_memory=True if torch.cuda.is_available() else False
+                pin_memory=pin_memory  # 分布式训练中禁用pin_memory
             )
         else:
             train_dataloader = DataLoader(
                 train_dataset, 
                 batch_size=self.batch_size, 
                 shuffle=True, 
-                num_workers=0,
-                collate_fn=collate_fn
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+                pin_memory=pin_memory
             )
             val_dataloader = DataLoader(
                 val_dataset, 
                 batch_size=self.batch_size, 
                 shuffle=False, 
-                num_workers=0,
-                collate_fn=collate_fn
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+                pin_memory=pin_memory
             )
         
         return train_dataloader, val_dataloader
