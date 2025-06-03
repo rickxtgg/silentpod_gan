@@ -88,17 +88,13 @@ setup_utf8_environment()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def collate_fn(batch):
-    """批量数据整理函数，确保数据在正确的设备上，支持分布式训练"""
+    """批量数据整理函数，保持数据在CPU上以支持pin_memory"""
     images, labels = zip(*batch)
-    # 在分布式训练中使用当前设备
-    if dist.is_initialized():
-        device = torch.cuda.current_device()
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    images = torch.stack([img.to(device) for img in images])
-    # 将标签转换为tensor并移动到设备
-    labels = torch.tensor(labels, device=device)
+    # 保持数据在CPU上，让DataLoader的pin_memory机制处理设备转移
+    images = torch.stack(list(images))
+    # 将标签转换为tensor，保持在CPU上
+    labels = torch.tensor(labels)
     return images, labels
 
 class MyDataset(Dataset):
