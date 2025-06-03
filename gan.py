@@ -850,16 +850,87 @@ class GANTrainer:
 
 
 if __name__ == '__main__':
-    # 修改硬编码路径 - 使用相对路径或从环境变量获取
-    dataset_path = os.getenv('DATASET_PATH', './dataset')  # 优先从环境变量获取，默认使用相对路径
+    # 添加命令行参数解析
+    parser = argparse.ArgumentParser(description='GAN训练器 - 支持分布式训练')
+    parser.add_argument('--train_dir', type=str, default='./dataset', 
+                       help='训练数据集路径')
+    parser.add_argument('--epochs', type=int, default=2000, 
+                       help='训练轮数')
+    parser.add_argument('--batch_size', type=int, default=1024, 
+                       help='批次大小')
+    parser.add_argument('--learning_rate', type=float, default=0.0002, 
+                       help='学习率')
+    parser.add_argument('--lr_g', type=float, default=None, 
+                       help='生成器学习率（如果不指定，使用learning_rate）')
+    parser.add_argument('--lr_d', type=float, default=None, 
+                       help='判别器学习率（如果不指定，使用learning_rate）')
+    parser.add_argument('--latent_dim', type=int, default=100, 
+                       help='潜在空间维度')
+    parser.add_argument('--image_size', type=int, default=64, 
+                       help='图像大小')
+    parser.add_argument('--num_layers', type=int, default=4, 
+                       help='网络层数')
+    parser.add_argument('--base_channels', type=int, default=64, 
+                       help='基础通道数')
+    parser.add_argument('--patience', type=int, default=500, 
+                       help='早停耐心值')
+    parser.add_argument('--validation_frequency', type=int, default=10, 
+                       help='验证频率（每N个epoch验证一次）')
+    parser.add_argument('--load_models', action='store_true', 
+                       help='是否加载预训练模型')
+    parser.add_argument('--start_epoch', type=int, default=0, 
+                       help='起始训练轮数')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, 
+                       help='梯度累积步数')
+    
+    args = parser.parse_args()
+    
+    # 处理学习率参数
+    lr_g = args.lr_g if args.lr_g is not None else args.learning_rate
+    lr_d = args.lr_d if args.lr_d is not None else args.learning_rate
+    
+    # 也支持从环境变量获取数据集路径（向后兼容）
+    dataset_path = os.getenv('DATASET_PATH', args.train_dir)
+    
+    # 在主进程中打印配置信息
+    if is_main_process():
+        print(f"🚀 启动GAN训练器")
+        print(f"📁 数据集路径: {dataset_path}")
+        print(f"🔄 训练轮数: {args.epochs}")
+        print(f"📦 批次大小: {args.batch_size}")
+        print(f"📊 学习率 - 生成器: {lr_g}, 判别器: {lr_d}")
+        print(f"🖼️  图像尺寸: {args.image_size}x{args.image_size}")
+        print(f"🏗️  网络层数: {args.num_layers}, 基础通道数: {args.base_channels}")
+        print(f"⏰ 早停耐心值: {args.patience}, 验证频率: {args.validation_frequency}")
+        print(f"🔄 加载预训练模型: {args.load_models}")
+        if args.start_epoch > 0:
+            print(f"▶️  从第 {args.start_epoch} 轮开始训练")
+    
     trainer = GANTrainer(
-        dataset_path=dataset_path, 
-        num_layers=4, 
-        base_channels=64,
-        load_models=True, 
-        epochs=2000,
-        batch_size=1024,
-        patience=500,
-        validation_frequency=10  # 新增参数：每10个epoch验证一次
+        dataset_path=dataset_path,
+        latent_dim=args.latent_dim,
+        lr_G=lr_g,
+        lr_D=lr_d,
+        batch_size=args.batch_size,
+        image_size=args.image_size,
+        epochs=args.epochs,
+        start_epoch=args.start_epoch,
+        patience=args.patience,
+        num_layers=args.num_layers,
+        base_channels=args.base_channels,
+        load_models=args.load_models,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        validation_frequency=args.validation_frequency
     )
-    trainer.train()
+    
+    try:
+        trainer.train()
+    except Exception as e:
+        if is_main_process():
+            print(f"❌ 训练过程中发生错误: {e}")
+        raise
+    finally:
+        # 清理分布式训练环境
+        cleanup_distributed()
+        if is_main_process():
+            print("🧹 分布式训练环境已清理")
